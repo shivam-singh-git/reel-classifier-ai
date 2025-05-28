@@ -1,58 +1,109 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from services.reel_fetcher import fetch_reel_data
-from services.classifier import classify_caption_with_mistral
-from utils.clean_text import clean_caption
-from services.reel_fusion_classifier import classify_reel_multimodal  # ✅ Updated import
-from utils.download_video import download_video_from_url
 import os
+import shutil
 import traceback
+from utils.frame_extractor import extract_keyframes
+from services.video_captioner import generate_video_summary
+from services.audio_transcriber import transcribe_audio
+from services.classifier import classify_caption_with_mistral
 
-app = FastAPI(title="Reel Classification API")
+def score_caption(text: str) -> float:
+    words = text.strip().split()
+    if len(words) < 20:
+        return 0
+    elif any(word in text.lower() for word in ["dm", "offer", "sale", "follow", "link in bio"]):
+        return 0
+    return 1.0
 
-class ReelRequest(BaseModel):
-    reel_url: str
+def score_audio(text: str) -> float:
+    words = text.strip().split()
+    if len(words) < 3:
+        return 0
+    elif len(words) < 10:
+        return 0.5
+    return 1.0
 
-class ClassificationResponse(BaseModel):
-    category: str
-    sub_category: str
-    sub_sub_category: str
+def score_image_caption(text: str) -> float:
+    return 1.0 if len(text.strip().split()) > 3 else 0.5
 
-@app.get("/")
-def root():
-    return {"message": "Reel Classification API is up and running 🚀"}
+def classify_reel_multimodal(video_path: str, original_caption: str = "") -> dict:
+    os.makedirs("temp", exist_ok=True)
 
-@app.post("/classify-reel", response_model=ClassificationResponse)
-def classify_reel(request: ReelRequest):
     try:
-        # Step 1: Fetch metadata
-        reel_data = fetch_reel_data(request.reel_url)
+        # Extract frames and generate video-level caption
+        frames = extract_keyframes(video_path)
+        if not frames:
+            raise Exception("No frames could be extracted from the video.")
 
-        if reel_data is None:
-            raise HTTPException(status_code=500, detail="Failed to fetch reel data — result is None. Check your API key and quota.")
+        image_caption = generate_video_summary(frames)
 
-        caption = reel_data.get("caption", {}).get("text", "").strip()
+        # Transcribe audio
+        audio_transcript = transcribe_audio(video_path)
 
-        # Step 2: Always download video — it's needed for fusion
-        video_url = reel_data["video_versions"][0]["url"]
-        os.makedirs("temp", exist_ok=True)
-        video_path = download_video_from_url(video_url, "temp/reel.mp4")
+        # Score inputs
+        caption_score = score_caption(original_caption)
+        image_score = score_image_caption(image_caption)
+        audio_score = score_audio(audio_transcript)
 
-        # Step 3: Run fusion classification using all inputs
-        classification_result = classify_reel_multimodal(video_path, original_caption=caption)
+        # Compose prompt
+        prompt = f"""You are a helpful AI that classifies Instagram reels into general 3-level categories for human browsing.
 
-        # Step 4: Cleanup
-        if os.path.exists(video_path):
-            os.remove(video_path)
+Use the inputs below and weigh them based on usefulness. Ignore any promotional or irrelevant content, especially from the caption.
 
-        # Step 5: Return only the final category breakdown (as per response model)
-        return classification_result["classification"]
+Guidelines:
+- Do NOT make classifications overly specific.
+- Classify in a way that a regular human would — general, practical, and intuitive.
+- For example, if a reel even *resembles* a gym video, classify it as:
+  Category: Fitness
+  Subcategory: Weightlifting
+  Sub-sub-category: [relevant body part or routine]
+
+Scores:
+- Caption: {caption_score}
+- Image: {image_score}
+- Audio: {audio_score}
+
+Inputs:
+Caption: "{original_caption if caption_score else 'DISREGARDED (short/promotional)'}"
+Image Description: "{image_caption}"
+Audio Transcript: "{audio_transcript}"
+
+Now classify the reel into the following format:
+{{
+  "category": "...",
+  "sub_category": "...",
+  "sub_sub_category": "..."
+}}
+"""
+
+        print("📤 LLM Prompt:\n", prompt)
+
+        result = classify_caption_with_mistral(prompt)
+
+        return {
+            "classification": result,
+            "weights": {
+                "caption": caption_score,
+                "image": image_score,
+                "audio": audio_score
+            },
+            "context_used": {
+                "caption": original_caption.strip(),
+                "image_caption": image_caption,
+                "audio_transcript": audio_transcript
+            },
+            "llm_prompt": prompt
+        }
 
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "classification": {
+                "category": "Uncategorized",
+                "sub_category": "Unknown",
+                "sub_sub_category": "Fallback"
+            },
+            "error": str(e)
+        }
 
-# Run this file directly: `python main.py`
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    finally:
+        shutil.rmtree("temp/frames", ignore_errors=True)

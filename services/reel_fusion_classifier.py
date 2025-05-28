@@ -1,18 +1,18 @@
 import os
-from utils.frame_extractor import extract_first_frame
-from services.image_captioner import generate_caption
+import shutil
+import traceback
+from utils.frame_extractor import extract_keyframes
+from services.video_captioner import generate_video_summary
 from services.audio_transcriber import transcribe_audio
 from services.classifier import classify_caption_with_mistral
-import traceback
 
 def score_caption(text: str) -> float:
     words = text.strip().split()
     if len(words) < 20:
-        return 0  # ✅ Ignore if < 20 words
+        return 0
     elif any(word in text.lower() for word in ["dm", "offer", "sale", "follow", "link in bio"]):
-        return 0  # ✅ Ignore if promotional
-    return 1.0  # ✅ Use only if long + useful
-
+        return 0
+    return 1.0
 
 def score_audio(text: str) -> float:
     words = text.strip().split()
@@ -27,12 +27,14 @@ def score_image_caption(text: str) -> float:
 
 def classify_reel_multimodal(video_path: str, original_caption: str = "") -> dict:
     os.makedirs("temp", exist_ok=True)
-    temp_frame = "temp/frame.jpg"
 
     try:
-        # Extract image frame and get image caption
-        extract_first_frame(video_path, temp_frame)
-        image_caption = generate_caption(temp_frame)
+        # Extract frames and generate video-level caption
+        frames = extract_keyframes(video_path)
+        if not frames:
+            raise Exception("No frames could be extracted from the video.")
+
+        image_caption = generate_video_summary(frames)
 
         # Transcribe audio
         audio_transcript = transcribe_audio(video_path)
@@ -42,7 +44,7 @@ def classify_reel_multimodal(video_path: str, original_caption: str = "") -> dic
         image_score = score_image_caption(image_caption)
         audio_score = score_audio(audio_transcript)
 
-        # Build smart prompt
+        # Compose prompt
         prompt = f"""You are a helpful AI that classifies Instagram reels into general 3-level categories for human browsing.
 
 Use the inputs below and weigh them based on usefulness. Ignore any promotional or irrelevant content, especially from the caption.
@@ -75,8 +77,6 @@ Now classify the reel into the following format:
 
         print("📤 LLM Prompt:\n", prompt)
 
-
-        # ❗ Call Mistral classification
         result = classify_caption_with_mistral(prompt)
 
         return {
@@ -106,5 +106,4 @@ Now classify the reel into the following format:
         }
 
     finally:
-        if os.path.exists(temp_frame):
-            os.remove(temp_frame)
+        shutil.rmtree("temp/frames", ignore_errors=True)
