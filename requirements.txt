@@ -1,0 +1,8 @@
+transformers>=4.39.0
+torch>=2.1.0
+sentencepiece  
+opencv-python
+transformers
+torch
+accelerate
+pillow
